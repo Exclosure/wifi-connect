@@ -6,7 +6,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use iron::modifiers::Redirect;
 use iron::prelude::*;
 use iron::{
-    headers, status, typemap, AfterMiddleware, Iron, IronError, IronResult, Request, Response, Url,
+    headers, status, typemap, AfterMiddleware, BeforeMiddleware, Iron, IronError, IronResult,
+    Request, Response, Url,
 };
 use iron_cors::CorsMiddleware;
 use mount::Mount;
@@ -111,6 +112,36 @@ where
     ))
 }
 
+struct RequestLogger;
+
+impl BeforeMiddleware for RequestLogger {
+    fn before(&self, req: &mut Request) -> IronResult<()> {
+        let request_id = &req as *const _ as usize;
+
+        info!("REQ ({}): {} {}", request_id, req.method, req.url);
+        Ok(())
+    }
+}
+
+impl AfterMiddleware for RequestLogger {
+    fn after(&self, req: &mut Request, res: Response) -> IronResult<Response> {
+        let request_id = &req as *const _ as usize;
+        let mut opt_code = res.status.map(|status| status.to_u16());
+        let return_code = opt_code.get_or_insert(0);
+        info!(
+            "RES ({}): {} {} ({})",
+            request_id, req.method, req.url, return_code
+        );
+
+        Ok(res)
+    }
+
+    fn catch(&self, _: &mut Request, err: IronError) -> IronResult<Response> {
+        error!("Error encountered: {:?}", err);
+        Err(err)
+    }
+}
+
 struct RedirectMiddleware;
 
 impl AfterMiddleware for RedirectMiddleware {
@@ -122,6 +153,12 @@ impl AfterMiddleware for RedirectMiddleware {
 
         if let Some(host) = req.headers.get::<headers::Host>() {
             if host.hostname != gateway {
+                info!(
+                    "Redirecting Request to {} to gateway: {}",
+                    req.url.host(),
+                    gateway
+                );
+
                 let url = Url::parse(&format!("http://{}/", gateway)).unwrap();
                 return Ok(Response::with((status::Found, Redirect(url))));
             }
@@ -163,8 +200,12 @@ pub fn start_server(
     let cors_middleware = CorsMiddleware::with_allow_any();
 
     let mut chain = Chain::new(assets);
+    chain.link_before(RequestLogger);
+    chain.link_after(RequestLogger);
     chain.link(Write::<RequestSharedState>::both(request_state));
-    chain.link_after(RedirectMiddleware);
+    chain
+        .link_after(RedirectMiddleware)
+        .link_after(RequestLogger);
     chain.link_around(cors_middleware);
 
     let address = format!("{}:{}", gateway_clone, listening_port);
@@ -212,7 +253,7 @@ fn connect(req: &mut Request) -> IronResult<Response> {
         (ssid, identity, passphrase)
     };
 
-    debug!("Incoming `connect` to access point `{}` request", ssid);
+    info!("Incoming `connect` to access point `{}` request", ssid);
 
     let request_state = get_request_state!(req);
 
